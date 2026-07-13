@@ -774,4 +774,56 @@ describe('getVisitedRegions', () => {
     expect(result.regions['ES']).toBeDefined();
     expect(result.regions['ES'][0].code).not.toBe('ES-B');
   });
+
+  it('ATLAS-UNIT-023: a place address disambiguates a border point the simplified admin0 polygon puts in the wrong country', async () => {
+    // A real Airbnb at Bollendorf-Pont sits on the Luxembourg side of the Sauer river,
+    // but the coordinates alone fall inside Germany's simplified admin0 polygon
+    // (border-simplification slop) — getCountryFromCoords(lat, lng) returns DE, so a
+    // coordinate-only region lookup finds nothing in DE. The place's own stored address
+    // says Luxembourg, so it is retried as a fallback before ever reaching Nominatim.
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Luxembourg Trip' });
+    insertPlaceWithCoords(
+      testDb, trip.id, 'Airbnb - Welcome Home', 49.8502458, 6.3576404,
+      '4 Gruusswiss, Bollendorf-Pont, Distrikt Gréiwemaacher 6555, Luxembourg'
+    );
+
+    await getVisitedRegions(user.id);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const result = await getVisitedRegions(user.id);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(result.regions['LU']).toBeDefined();
+    expect(result.regions['DE']).toBeUndefined();
+  });
+
+  it('ATLAS-UNIT-024: a US place whose address ends in a state abbreviation still resolves by coordinates, ignoring the address', async () => {
+    // getCountryFromAddress() treats any 2-letter uppercase last address segment as an
+    // ISO country code — "...CA" parses as Canada, not California. Trusting the address
+    // FIRST (as ATLAS-UNIT-023 might suggest) would send a San Francisco hotel's region
+    // lookup to Canada and fail to find one, costing a needless Nominatim round trip (or
+    // worse, a wrong match) for every US place whose address ends in a state code.
+    // Coordinates resolve this correctly on their own, so the address must only be
+    // consulted when the coordinate-only lookup finds nothing.
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'San Francisco Trip' });
+    insertPlaceWithCoords(
+      testDb, trip.id, 'Hotel Pickwick', 37.7830549, -122.4066689,
+      '85 5th St, San Francisco, CA'
+    );
+
+    await getVisitedRegions(user.id);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const result = await getVisitedRegions(user.id);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(result.regions['US']).toBeDefined();
+    expect(result.regions['CA']).toBeUndefined();
+  });
 });

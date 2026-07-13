@@ -395,7 +395,7 @@ function resolvePlaceCountries(places: Place[]): Map<number, string> {
       try {
         for (const place of uncachedForGeocode) {
           try {
-            const info = await reverseGeocodeRegion(place.lat!, place.lng!);
+            const info = await reverseGeocodeRegion(place.lat!, place.lng!, place.address);
             if (info) insertStmt.run(place.id, info.country_code, info.region_code, info.region_name);
           } catch { /* continue */ }
           finally { geocodingInFlight.delete(place.id); }
@@ -768,7 +768,7 @@ function buildRegionInfo(address: Record<string, string>, preferFinest: boolean)
   };
 }
 
-async function reverseGeocodeRegion(lat: number, lng: number): Promise<RegionInfo | null> {
+async function reverseGeocodeRegion(lat: number, lng: number, placeAddress?: string | null): Promise<RegionInfo | null> {
   const key = roundKey(lat, lng);
   if (regionCache.has(key)) return regionCache.get(key)!;
 
@@ -776,12 +776,28 @@ async function reverseGeocodeRegion(lat: number, lng: number): Promise<RegionInf
   // — unlike Nominatim's address levels — guaranteed to match a feature the client can
   // actually highlight. Falls through to reverse geocoding when the country has no
   // admin1 coverage or the point lands outside every polygon.
-  const countryCode = getCountryFromCoords(lat, lng);
-  if (countryCode) {
-    const fromBundle = getRegionFromCoords(countryCode, lat, lng);
+  const coordCountry = getCountryFromCoords(lat, lng);
+  if (coordCountry) {
+    const fromBundle = getRegionFromCoords(coordCountry, lat, lng);
     if (fromBundle) {
       regionCache.set(key, fromBundle);
       return fromBundle;
+    }
+  }
+  // The coordinate-only lookup found no matching region — either no country polygon
+  // contains the point, or a simplified admin0 border put it in the WRONG country (a
+  // place on the Luxembourg side of the Sauer river at Bollendorf-Pont fell inside
+  // Germany's simplified box). Retry against the place's own stored address, same as
+  // resolveCountryCode(Sync) already prefer for country resolution — but only as a
+  // fallback: trusting it FIRST regressed places whose address ends in a US state
+  // abbreviation that collides with a real ISO code (e.g. "...CA" parsed as Canada
+  // instead of California), which coordinates alone already resolved correctly.
+  const addressCountry = getCountryFromAddress(placeAddress ?? null);
+  if (addressCountry && addressCountry !== coordCountry) {
+    const fromAddress = getRegionFromCoords(addressCountry, lat, lng);
+    if (fromAddress) {
+      regionCache.set(key, fromAddress);
+      return fromAddress;
     }
   }
 
@@ -821,7 +837,7 @@ export async function getVisitedRegions(userId: number): Promise<{ regions: Reco
       try {
         for (const place of uncached) {
           try {
-            const info = await reverseGeocodeRegion(place.lat!, place.lng!);
+            const info = await reverseGeocodeRegion(place.lat!, place.lng!, place.address);
             if (info) insertStmt.run(place.id, info.country_code, info.region_code, info.region_name);
           } catch {
             // individual failure — continue with remaining places
