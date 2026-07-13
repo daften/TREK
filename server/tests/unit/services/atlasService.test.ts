@@ -826,4 +826,35 @@ describe('getVisitedRegions', () => {
     expect(result.regions['US']).toBeDefined();
     expect(result.regions['CA']).toBeUndefined();
   });
+
+  it('ATLAS-UNIT-025: when the bundle-only lookup finds nothing, the Nominatim fallback keeps the coarse GB constituent-country code instead of rescuing to a finer one', async () => {
+    // Mid-Atlantic open ocean — getCountryFromCoords finds no country and there's no
+    // address, so this always falls through to the Nominatim path. That path used to re-query at a
+    // finer zoom for GB and swap in a county/borough code (GB-MAN, GB-LND, …) that targeted
+    // Natural Earth's old, finer GB polygons — the current geoBoundaries bundle only has the
+    // 4 constituent countries, so that rescued code could never match anything and the
+    // region would never highlight. The coarse Nominatim result (GB-ENG) IS a real bundle
+    // feature and must be kept as-is, with a single geocode call (no zoom=10 re-query).
+    vi.useFakeTimers();
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ address: { country_code: 'gb', 'ISO3166-2-lvl4': 'GB-ENG', state: 'England' } }),
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Middle of the ocean' });
+    insertPlaceWithCoords(testDb, trip.id, 'Buoy', 10, -40);
+
+    await getVisitedRegions(user.id);
+    await vi.runAllTimersAsync();
+    const result = await getVisitedRegions(user.id);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    expect(result.regions['GB']).toBeDefined();
+    const codes = result.regions['GB'].map((r: any) => r.code);
+    expect(codes).toContain('GB-ENG');
+
+    vi.useRealTimers();
+  });
 });

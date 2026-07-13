@@ -660,11 +660,6 @@ const geocodingInFlight = new Set<number>();
 
 const regionCache = new Map<string, RegionInfo | null>();
 
-// A zoom-8 reverse geocode of a GB place only resolves to the constituent country
-// (England/Scotland/Wales/Northern Ireland). Natural Earth's admin-1 polygons for GB
-// are counties and boroughs, so those four codes match no polygon and never highlight.
-const GB_CONSTITUENT_CODES = new Set(['GB-ENG', 'GB-SCT', 'GB-WLS', 'GB-NIR']);
-
 // ── Point-in-polygon over the bundled admin1 regions ────────────────────────
 //
 // Nominatim's reverse-geocode address levels (province, autonomous community,
@@ -801,17 +796,16 @@ async function reverseGeocodeRegion(lat: number, lng: number, placeAddress?: str
     }
   }
 
+  // Only reached when the bundle's own polygons for this country don't cover the point at
+  // all (coastal/simplification gaps at the coordinate AND, for GB, at the constituent
+  // country's box too) — a genuinely rare miss, not the common case. Nominatim's coarse
+  // address level (state/province) is what the bundle actually carries; a former "rescue"
+  // to a finer county/borough level here (GB-MAN, GB-LND, …) targeted Natural Earth's old,
+  // finer-grained GB polygons and produces a code the current geoBoundaries bundle (which
+  // only has the 4 GB constituent countries) can never match — removed.
   const address = await fetchNominatimAddress(lat, lng, 8);
   if (!address) return null; // transient failure — leave uncached so a later call retries
-  let info = buildRegionInfo(address, false);
-  // GB constituent-country codes map to no admin-1 polygon, so re-resolve them at a finer
-  // zoom where Nominatim exposes the county/borough code (GB-LND, GB-MAN, GB-CON, …) that
-  // the polygons actually carry.
-  if (info && info.country_code === 'GB' && GB_CONSTITUENT_CODES.has(info.region_code)) {
-    const finerAddress = await fetchNominatimAddress(lat, lng, 10);
-    const finer = finerAddress ? buildRegionInfo(finerAddress, true) : null;
-    if (finer && !GB_CONSTITUENT_CODES.has(finer.region_code)) info = finer;
-  }
+  const info = buildRegionInfo(address, false);
   regionCache.set(key, info);
   return info;
 }
