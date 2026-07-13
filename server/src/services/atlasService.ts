@@ -653,7 +653,7 @@ export function unmarkRegionVisited(userId: number, regionCode: string): void {
 
 // ── Sub-national region resolution ────────────────────────────────────────
 
-interface RegionInfo { country_code: string; region_code: string; region_name: string }
+export interface RegionInfo { country_code: string; region_code: string; region_name: string }
 
 // Tracks place IDs currently being geocoded in the background to prevent duplicate enqueuing.
 const geocodingInFlight = new Set<number>();
@@ -664,6 +664,67 @@ const regionCache = new Map<string, RegionInfo | null>();
 // (England/Scotland/Wales/Northern Ireland). Natural Earth's admin-1 polygons for GB
 // are counties and boroughs, so those four codes match no polygon and never highlight.
 const GB_CONSTITUENT_CODES = new Set(['GB-ENG', 'GB-SCT', 'GB-WLS', 'GB-NIR']);
+
+// ── Point-in-polygon over the bundled admin1 regions ────────────────────────
+//
+// Nominatim's reverse-geocode address levels (province, autonomous community,
+// borough, …) don't line up with whatever granularity geoBoundaries happens to ship
+// per country — e.g. Nominatim gives Barcelona the *province* code ES-B while the
+// bundle only has the *autonomous-community* level (Catalonia), and Belgium/Italy's
+// bundle only has 3-5 top-level regions while Nominatim returns provinces. Comparing
+// those codes/names (even accent/dash-normalized, see #atlas-region-match) can never
+// match because they name different levels of subdivision. Resolving the place's own
+// lat/lng directly against the SAME polygons the client renders — like
+// getCountryFromCoords does for admin0 (#1331) — sidesteps the whole class of bug: the
+// stored region_code/region_name are then guaranteed to equal a bundle feature.
+type RegionFeature = { code: string; name: string; nameEn: string; geometry: Geometry; box: Box };
+let regionIndex: Map<string, RegionFeature[]> | null = null;
+
+function buildRegionIndex(): void {
+  const byCountry = new Map<string, RegionFeature[]>();
+  for (const f of loadGeoBundle('admin1').features ?? []) {
+    const a2 = (f.properties?.iso_a2 || '').toUpperCase();
+    const code = f.properties?.iso_3166_2;
+    if (!a2 || !code || !f.geometry) continue;
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+    const parts = (f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates) as number[][][][];
+    for (const part of parts) {
+      for (const [lng, lat] of part[0]) {
+        if (lng < minLng) minLng = lng;
+        if (lng > maxLng) maxLng = lng;
+        if (lat < minLat) minLat = lat;
+        if (lat > maxLat) maxLat = lat;
+      }
+    }
+    const list = byCountry.get(a2) ?? [];
+    list.push({ code, name: f.properties?.name || code, nameEn: f.properties?.name_en || f.properties?.name || code, geometry: f.geometry, box: [minLng, minLat, maxLng, maxLat] });
+    byCountry.set(a2, list);
+  }
+  regionIndex = byCountry;
+}
+
+function getRegionIndex(): Map<string, RegionFeature[]> {
+  if (!regionIndex) buildRegionIndex();
+  return regionIndex!;
+}
+
+// Resolve (lat,lng) to a bundled admin1 region within the given country, smallest-box-first
+// so a point near a shared border prefers the tighter-fitting candidate. Returns null when
+// the country has no admin1 coverage in the bundle or the point falls outside every polygon
+// (simplification gaps at coastlines, etc.) — callers should fall back to reverse geocoding.
+export function getRegionFromCoords(countryCode: string, lat: number, lng: number): RegionInfo | null {
+  const features = getRegionIndex().get(countryCode.toUpperCase());
+  if (!features || features.length === 0) return null;
+  const candidates = features
+    .filter(f => lat >= f.box[1] && lat <= f.box[3] && lng >= f.box[0] && lng <= f.box[2])
+    .sort((a, b) => (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]) - (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]));
+  for (const f of candidates) {
+    if (pointInGeometry(lng, lat, f.geometry)) {
+      return { country_code: countryCode.toUpperCase(), region_code: f.code, region_name: f.nameEn || f.name };
+    }
+  }
+  return null;
+}
 
 // Returns the OSM address object, {} for an "ok but empty" response (so it is cached as
 // a definitive miss), or null for a transient failure (so it is retried next time).
@@ -710,6 +771,20 @@ function buildRegionInfo(address: Record<string, string>, preferFinest: boolean)
 async function reverseGeocodeRegion(lat: number, lng: number): Promise<RegionInfo | null> {
   const key = roundKey(lat, lng);
   if (regionCache.has(key)) return regionCache.get(key)!;
+
+  // Prefer resolving directly against the bundled polygons: offline, deterministic, and
+  // — unlike Nominatim's address levels — guaranteed to match a feature the client can
+  // actually highlight. Falls through to reverse geocoding when the country has no
+  // admin1 coverage or the point lands outside every polygon.
+  const countryCode = getCountryFromCoords(lat, lng);
+  if (countryCode) {
+    const fromBundle = getRegionFromCoords(countryCode, lat, lng);
+    if (fromBundle) {
+      regionCache.set(key, fromBundle);
+      return fromBundle;
+    }
+  }
+
   const address = await fetchNominatimAddress(lat, lng, 8);
   if (!address) return null; // transient failure — leave uncached so a later call retries
   let info = buildRegionInfo(address, false);

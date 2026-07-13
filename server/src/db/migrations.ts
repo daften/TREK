@@ -3626,6 +3626,25 @@ function runMigrations(db: Database.Database): void {
         );
       `);
     },
+
+    // `place_regions` is a re-derivable Nominatim cache (see the geoBoundaries migration
+    // above), but it is only ever populated for a place ID that isn't already cached — a
+    // wrong row, once written, was permanent. Nominatim's reverse-geocode address levels
+    // (province, autonomous community, borough, …) don't always match whatever granularity
+    // geoBoundaries ships per country (e.g. Barcelona cached at the ES-B *province* level
+    // while the bundle only carries the ES-CT *autonomous-community* level for Spain), so
+    // affected places silently never highlighted their region on the Atlas map. Region
+    // resolution now resolves lat/lng directly against the bundled polygons first (falling
+    // back to Nominatim only when a country has no admin1 coverage), which is immune to
+    // this mismatch — but that only helps places re-resolved after this fix. Clear the
+    // cache so every place is re-resolved on next Atlas load.
+    () => {
+      try {
+        db.exec('DELETE FROM place_regions');
+      } catch (err: any) {
+        if (!err.message?.includes('no such table')) throw err;
+      }
+    },
   ];
 
   if (currentVersion < migrations.length) {

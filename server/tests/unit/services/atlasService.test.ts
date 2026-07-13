@@ -728,32 +728,50 @@ describe('getVisitedRegions', () => {
     expect(codes).toContain('FR-75');
   });
 
-  it('ATLAS-UNIT-021: GB places resolving to a constituent country are re-resolved to the finer admin-1 code', async () => {
-    vi.useFakeTimers();
-    // A zoom-8 lookup only yields the constituent country (GB-ENG); the zoom-10 lookup
-    // exposes the borough code (GB-MAN) that Natural Earth's polygons actually carry.
-    vi.stubGlobal('fetch', vi.fn().mockImplementation((url: string) => Promise.resolve({
-      ok: true,
-      json: async () => ({
-        address: url.includes('zoom=10')
-          ? { country_code: 'gb', 'ISO3166-2-lvl8': 'GB-MAN', city: 'Manchester', state: 'England', 'ISO3166-2-lvl4': 'GB-ENG' }
-          : { country_code: 'gb', 'ISO3166-2-lvl4': 'GB-ENG', state: 'England' },
-      }),
-    })));
+  it('ATLAS-UNIT-021: a GB place resolves against the bundled admin1 polygon without calling Nominatim', async () => {
+    // The shipped geoBoundaries bundle only carries GB's 4 constituent countries
+    // (England/Scotland/Wales/Northern Ireland) — no county/borough level. Resolving
+    // Old Trafford's coordinates directly against those polygons lands on GB-ENG, the
+    // same feature the client highlights, with no reverse-geocode round trip at all.
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
 
     const { user } = createUser(testDb);
     const trip = createTrip(testDb, user.id, { title: 'Manchester Trip' });
     insertPlaceWithCoords(testDb, trip.id, 'Old Trafford', 53.4631, -2.2913);
 
     await getVisitedRegions(user.id);
-    await vi.runAllTimersAsync();
+    // The background geocode is fire-and-forget; give its microtasks a turn to settle
+    // before reading the now-cached result back.
+    await new Promise(resolve => setTimeout(resolve, 10));
     const result = await getVisitedRegions(user.id);
 
+    expect(mockFetch).not.toHaveBeenCalled();
     expect(result.regions['GB']).toBeDefined();
     const codes = result.regions['GB'].map((r: any) => r.code);
-    expect(codes).toContain('GB-MAN');
-    expect(codes).not.toContain('GB-ENG');
+    expect(codes).toContain('GB-ENG');
+  });
 
-    vi.useRealTimers();
+  it('ATLAS-UNIT-022: a place whose Nominatim region level is finer than the bundle (Spain province vs autonomous community) still resolves to a bundle-matching feature', async () => {
+    // Regression for the Barcelona/Madrid bug: Nominatim's ISO3166-2-lvl6 gives the
+    // *province* (ES-B), but the bundle only has the *autonomous-community* level
+    // (Catalonia). Resolving by coordinates instead of trusting the geocoder's level
+    // guarantees a code the client bundle actually carries.
+    const mockFetch = vi.fn();
+    vi.stubGlobal('fetch', mockFetch);
+
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Barcelona Trip' });
+    insertPlaceWithCoords(testDb, trip.id, 'Sagrada Familia', 41.4036, 2.1744);
+
+    await getVisitedRegions(user.id);
+    // The background geocode is fire-and-forget; give its microtasks a turn to settle
+    // before reading the now-cached result back.
+    await new Promise(resolve => setTimeout(resolve, 10));
+    const result = await getVisitedRegions(user.id);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+    expect(result.regions['ES']).toBeDefined();
+    expect(result.regions['ES'][0].code).not.toBe('ES-B');
   });
 });
