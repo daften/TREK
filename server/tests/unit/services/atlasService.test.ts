@@ -622,6 +622,36 @@ describe('getStats — extended', () => {
 
     expect(stats.lastTrip).toBeNull();
   });
+
+  it('ATLAS-UNIT-027: a US place whose address ends in a state abbreviation resolves to US, not the colliding ISO country', async () => {
+    // getCountryFromAddress()'s "2-letter uppercase last segment = ISO code" heuristic
+    // parses "..., CA" as Canada (a real ISO code), not California. resolveCountryCodeSync
+    // used to try the address FIRST, so a place with coordinates that plainly resolve to the
+    // US via getCountryFromCoords would still get bucketed under Canada. Mirrors the
+    // region-level fix (ATLAS-UNIT-024) at the country level.
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'San Francisco Trip' });
+    insertPlaceWithCoords(testDb, trip.id, 'Hotel Pickwick', 37.7830549, -122.4066689, '85 5th St, San Francisco, CA');
+
+    const stats = await getStats(user.id);
+
+    const codes = stats.countries.map((c: any) => c.code);
+    expect(codes).toContain('US');
+    expect(codes).not.toContain('CA');
+  });
+
+  it('ATLAS-UNIT-028: lastTrip.countryCode resolves via coordinates, not a misparsed state-abbreviation address', async () => {
+    // lastTrip.countryCode calls resolveCountryCodeSync directly (not through the
+    // place_regions cache), so this exercises the fix independently of ATLAS-UNIT-027.
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Past NY Trip', start_date: '2023-05-01', end_date: '2023-05-10' });
+    insertPlaceWithCoords(testDb, trip.id, 'Imperial Court Hotel', 40.7848394, -73.981643, '307 W 79th Street, New York, NY');
+
+    const stats = await getStats(user.id);
+
+    expect(stats.lastTrip).not.toBeNull();
+    expect(stats.lastTrip!.countryCode).toBe('US');
+  });
 });
 
 // ── getCountryPlaces ─────────────────────────────────────────────────────────

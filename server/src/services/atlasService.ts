@@ -341,25 +341,47 @@ export function getCountryFromAddress(address: string | null): string | null {
   return null;
 }
 
-// ── Resolve a place to a country code (address -> bbox -> geocode) ──────────
-
+// ── Resolve a place to a country code (bbox -> address -> geocode) ──────────
+//
+// Coordinates are tried FIRST and, when they resolve, trusted outright — getCountryFromCoords
+// is a real point-in-polygon test against the same borders the map renders. Address parsing
+// is only a fallback. It used to run first, but its "2-letter uppercase last segment = ISO
+// code" heuristic collides with US state abbreviations that are ALSO real ISO country codes
+// (DE=Germany, GA=Georgia, IN=India, LA=Laos, MD=Moldova, MA=Morocco, MN=Mongolia, MO=Macau,
+// MT=Malta, NE=Niger, PA=Panama, SD=Sudan, TN=Tunisia, VA=Vatican, CA=Canada, ...) — a place
+// stored as "..., San Francisco, CA" resolved to Canada, not the United States, whenever
+// address ran first. When coordinates are present but didn't resolve to any country, the
+// address result is sanity-gated against that country's own admin0 bounding box
+// (isPointInCountryBox) before being trusted — same guard as the region-level address
+// fallback (#atlas-region-match). A place with no coordinates at all has nothing to gate
+// against, so the address is trusted directly there, as before.
 async function resolveCountryCode(place: Place): Promise<string | null> {
-  let code = getCountryFromAddress(place.address);
-  if (!code && place.lat && place.lng) {
-    code = getCountryFromCoords(place.lat, place.lng);
+  const hasCoords = !!(place.lat && place.lng);
+  if (hasCoords) {
+    const fromCoords = getCountryFromCoords(place.lat!, place.lng!);
+    if (fromCoords) return fromCoords;
   }
-  if (!code && place.lat && place.lng) {
-    code = await reverseGeocodeCountry(place.lat, place.lng);
+  const fromAddress = getCountryFromAddress(place.address);
+  if (fromAddress && (!hasCoords || isPointInCountryBox(fromAddress, place.lat!, place.lng!))) {
+    return fromAddress;
   }
-  return code;
+  if (hasCoords) {
+    return await reverseGeocodeCountry(place.lat!, place.lng!);
+  }
+  return null;
 }
 
 function resolveCountryCodeSync(place: Place): string | null {
-  let code = getCountryFromAddress(place.address);
-  if (!code && place.lat && place.lng) {
-    code = getCountryFromCoords(place.lat, place.lng);
+  const hasCoords = !!(place.lat && place.lng);
+  if (hasCoords) {
+    const fromCoords = getCountryFromCoords(place.lat!, place.lng!);
+    if (fromCoords) return fromCoords;
   }
-  return code;
+  const fromAddress = getCountryFromAddress(place.address);
+  if (fromAddress && (!hasCoords || isPointInCountryBox(fromAddress, place.lat!, place.lng!))) {
+    return fromAddress;
+  }
+  return null;
 }
 
 // ── Shared query: all trips the user owns or is a member of ─────────────────
