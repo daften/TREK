@@ -225,6 +225,27 @@ type Box = [number, number, number, number]; // [minLng, minLat, maxLng, maxLat]
 let countryPolyIndex: Map<string, Geometry> | null = null;
 let countryBoxIndex: Map<string, Box[]> | null = null;
 
+// One box PER GEOMETRY PART, not one box per feature. A single combined box around a
+// shape that straddles the antimeridian, or has far-flung island parts (Alaska +
+// Chukotka for RU; Illes Balears/Canarias-style outliers for a region), would span way
+// more than the shape actually covers, degrading the box prefilter and skewing the
+// smallest-box tie-break. Shared by both the admin0 and admin1 indexes below.
+function boxesForGeometry(geometry: Geometry): Box[] {
+  const parts = (geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.coordinates) as number[][][][];
+  const boxes: Box[] = [];
+  for (const part of parts) {
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+    for (const [lng, lat] of part[0]) {
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+    }
+    boxes.push([minLng, minLat, maxLng, maxLat]);
+  }
+  return boxes;
+}
+
 function buildCountryIndexes(): void {
   const polys = new Map<string, Geometry>();
   const boxes = new Map<string, Box[]>();
@@ -234,20 +255,7 @@ function buildCountryIndexes(): void {
     if (!raw || raw === '-99' || !f.geometry) continue;
     const code = String(raw).toUpperCase();
     polys.set(code, f.geometry);
-
-    const parts = (f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates) as number[][][][];
-    const codeBoxes = boxes.get(code) ?? [];
-    for (const part of parts) {
-      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
-      for (const [lng, lat] of part[0]) {
-        if (lng < minLng) minLng = lng;
-        if (lng > maxLng) maxLng = lng;
-        if (lat < minLat) minLat = lat;
-        if (lat > maxLat) maxLat = lat;
-      }
-      codeBoxes.push([minLng, minLat, maxLng, maxLat]);
-    }
-    boxes.set(code, codeBoxes);
+    boxes.set(code, [...(boxes.get(code) ?? []), ...boxesForGeometry(f.geometry)]);
   }
 
   // Micro-territories aren't in admin0 — give them their box, but no polygon.
@@ -267,6 +275,16 @@ function getCountryPolyIndex(): Map<string, Geometry> {
 function getCountryBoxIndex(): Map<string, Box[]> {
   if (!countryBoxIndex) buildCountryIndexes();
   return countryBoxIndex!;
+}
+
+// Broad sanity check — is (lat,lng) anywhere within the country's own admin0 bounding
+// box(es)? Deliberately looser than the polygon test in getCountryFromCoords: a genuine
+// border-simplification miss (a point just outside the exact border) still needs to pass
+// this, so it only rejects a country that isn't even in the right part of the globe.
+export function isPointInCountryBox(countryCode: string, lat: number, lng: number): boolean {
+  const boxes = getCountryBoxIndex().get(countryCode.toUpperCase());
+  if (!boxes) return false;
+  return boxes.some(([minLng, minLat, maxLng, maxLat]) => lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng);
 }
 
 export function getCountryFromCoords(lat: number, lng: number): string | null {
@@ -672,7 +690,10 @@ const regionCache = new Map<string, RegionInfo | null>();
 // lat/lng directly against the SAME polygons the client renders — like
 // getCountryFromCoords does for admin0 (#1331) — sidesteps the whole class of bug: the
 // stored region_code/region_name are then guaranteed to equal a bundle feature.
-type RegionFeature = { code: string; name: string; nameEn: string; geometry: Geometry; box: Box };
+// Per-part boxes (see boxesForGeometry above) — an archipelago-style region (Illes
+// Balears, Canarias, ...) gets one tight box per island group instead of one box
+// spanning the whole span between them.
+type RegionFeature = { code: string; name: string; nameEn: string; geometry: Geometry; boxes: Box[] };
 let regionIndex: Map<string, RegionFeature[]> | null = null;
 
 function buildRegionIndex(): void {
@@ -681,18 +702,14 @@ function buildRegionIndex(): void {
     const a2 = (f.properties?.iso_a2 || '').toUpperCase();
     const code = f.properties?.iso_3166_2;
     if (!a2 || !code || !f.geometry) continue;
-    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
-    const parts = (f.geometry.type === 'Polygon' ? [f.geometry.coordinates] : f.geometry.coordinates) as number[][][][];
-    for (const part of parts) {
-      for (const [lng, lat] of part[0]) {
-        if (lng < minLng) minLng = lng;
-        if (lng > maxLng) maxLng = lng;
-        if (lat < minLat) minLat = lat;
-        if (lat > maxLat) maxLat = lat;
-      }
-    }
     const list = byCountry.get(a2) ?? [];
-    list.push({ code, name: f.properties?.name || code, nameEn: f.properties?.name_en || f.properties?.name || code, geometry: f.geometry, box: [minLng, minLat, maxLng, maxLat] });
+    list.push({
+      code,
+      name: f.properties?.name || code,
+      nameEn: f.properties?.name_en || f.properties?.name || code,
+      geometry: f.geometry,
+      boxes: boxesForGeometry(f.geometry),
+    });
     byCountry.set(a2, list);
   }
   regionIndex = byCountry;
@@ -703,17 +720,25 @@ function getRegionIndex(): Map<string, RegionFeature[]> {
   return regionIndex!;
 }
 
-// Resolve (lat,lng) to a bundled admin1 region within the given country, smallest-box-first
-// so a point near a shared border prefers the tighter-fitting candidate. Returns null when
-// the country has no admin1 coverage in the bundle or the point falls outside every polygon
+// Resolve (lat,lng) to a bundled admin1 region within the given country, smallest
+// matching-part-first (mirroring getCountryFromCoords' candidate ranking) so a point
+// near a shared border prefers the tighter-fitting candidate. Returns null when the
+// country has no admin1 coverage in the bundle or the point falls outside every polygon
 // (simplification gaps at coastlines, etc.) — callers should fall back to reverse geocoding.
 export function getRegionFromCoords(countryCode: string, lat: number, lng: number): RegionInfo | null {
   const features = getRegionIndex().get(countryCode.toUpperCase());
   if (!features || features.length === 0) return null;
-  const candidates = features
-    .filter(f => lat >= f.box[1] && lat <= f.box[3] && lng >= f.box[0] && lng <= f.box[2])
-    .sort((a, b) => (a.box[2] - a.box[0]) * (a.box[3] - a.box[1]) - (b.box[2] - b.box[0]) * (b.box[3] - b.box[1]));
-  for (const f of candidates) {
+  const candidates: { f: RegionFeature; area: number }[] = [];
+  for (const f of features) {
+    for (const [minLng, minLat, maxLng, maxLat] of f.boxes) {
+      if (lat >= minLat && lat <= maxLat && lng >= minLng && lng <= maxLng) {
+        candidates.push({ f, area: (maxLng - minLng) * (maxLat - minLat) });
+        break;
+      }
+    }
+  }
+  candidates.sort((a, b) => a.area - b.area);
+  for (const { f } of candidates) {
     if (pointInGeometry(lng, lat, f.geometry)) {
       return { country_code: countryCode.toUpperCase(), region_code: f.code, region_name: f.nameEn || f.name };
     }
@@ -787,8 +812,15 @@ async function reverseGeocodeRegion(lat: number, lng: number, placeAddress?: str
   // fallback: trusting it FIRST regressed places whose address ends in a US state
   // abbreviation that collides with a real ISO code (e.g. "...CA" parsed as Canada
   // instead of California), which coordinates alone already resolved correctly.
+  //
+  // Sanity-gate the address country against its own admin0 BOX (not the tighter polygon
+  // — the Luxembourg case above needs a country whose exact border misses this very
+  // point) before trusting a region match in it. Without this, a wrong or malformed
+  // address country (a free-text `state` field, a mis-tagged 2-letter code) could in
+  // principle still land inside some real admin1 polygon a world away from the actual
+  // coordinates and get treated as a match.
   const addressCountry = getCountryFromAddress(placeAddress ?? null);
-  if (addressCountry && addressCountry !== coordCountry) {
+  if (addressCountry && addressCountry !== coordCountry && isPointInCountryBox(addressCountry, lat, lng)) {
     const fromAddress = getRegionFromCoords(addressCountry, lat, lng);
     if (fromAddress) {
       regionCache.set(key, fromAddress);

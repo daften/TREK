@@ -31,7 +31,7 @@ import { createTables } from '../../../src/db/schema';
 import { runMigrations } from '../../../src/db/migrations';
 import { resetTestDb } from '../../helpers/test-db';
 import { createUser, createTrip, createReservation } from '../../helpers/factories';
-import { getStats, getCached, setCache, getCountryFromCoords, getCountryFromAddress, reverseGeocodeCountry, getRegionGeo, getCountryGeo, getCountryPlaces, getVisitedRegions, markCountryVisited, unmarkCountryVisited } from '../../../src/services/atlasService';
+import { getStats, getCached, setCache, getCountryFromCoords, getCountryFromAddress, isPointInCountryBox, reverseGeocodeCountry, getRegionGeo, getCountryGeo, getCountryPlaces, getVisitedRegions, markCountryVisited, unmarkCountryVisited } from '../../../src/services/atlasService';
 
 function insertReservationEndpoint(
   db: any,
@@ -314,6 +314,27 @@ describe('getCountryFromCoords', () => {
     expect(getCountryFromCoords(41.9973, 21.4280)).toBe('MK'); // Skopje
     expect(getCountryFromCoords(42.0106, 20.9714)).toBe('MK'); // Tetovo
     expect(getCountryFromCoords(42.6629, 21.1655)).toBe('XK'); // Pristina
+  });
+});
+
+// ── isPointInCountryBox — sanity gate for the address-derived region fallback ──────
+
+describe('isPointInCountryBox', () => {
+  it('ATLAS-SVC-006a: accepts a country whose box genuinely covers the point, even where the exact border excludes it', () => {
+    // Bollendorf-Pont: on the Luxembourg side of the border, but outside LU's exact
+    // simplified polygon (see getCountryFromCoords returning DE for this same point in
+    // atlasService.test.ts's region-resolution tests). The box gate must stay loose
+    // enough to admit this, or the Luxembourg address-fallback fix would regress.
+    expect(isPointInCountryBox('LU', 49.8502458, 6.3576404)).toBe(true);
+  });
+
+  it('ATLAS-SVC-006b: rejects a country whose box is nowhere near the point', () => {
+    // Mid-Atlantic, nowhere close to Japan under any simplification.
+    expect(isPointInCountryBox('JP', 20, -35)).toBe(false);
+  });
+
+  it('ATLAS-SVC-006c: returns false for an unknown/garbage country code', () => {
+    expect(isPointInCountryBox('ZZ', 48.85, 2.35)).toBe(false);
   });
 });
 
@@ -854,6 +875,41 @@ describe('getVisitedRegions', () => {
     expect(result.regions['GB']).toBeDefined();
     const codes = result.regions['GB'].map((r: any) => r.code);
     expect(codes).toContain('GB-ENG');
+
+    vi.useRealTimers();
+  });
+
+  it('ATLAS-UNIT-026: an address country nowhere near the coordinates is rejected before it can produce a bogus region match', async () => {
+    // Coordinates in the open mid-Atlantic (no country polygon contains them) paired
+    // with a stored address ending in "JP" — getCountryFromAddress()'s 2-letter-uppercase
+    // heuristic returns 'JP' regardless of how implausible that is for these coordinates.
+    // Without a sanity check, getRegionFromCoords('JP', ...) would only return null because
+    // no Japanese region polygon happens to reach the mid-Atlantic — but that's incidental,
+    // not a guarantee, for some other coordinate/bogus-code combination. The admin0 box
+    // gate rejects JP outright (its bounding box is nowhere near these coordinates) so the
+    // address is never even tried against JP's regions, and resolution correctly falls
+    // through to Nominatim instead of risking a wrong match.
+    vi.useFakeTimers();
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ address: {} }), // Nominatim finds nothing here either
+    });
+    vi.stubGlobal('fetch', mockFetch);
+
+    const { user } = createUser(testDb);
+    const trip = createTrip(testDb, user.id, { title: 'Mid-Atlantic buoy' });
+    // Different coordinates than ATLAS-UNIT-025's mid-Atlantic point — reverseGeocodeRegion's
+    // regionCache is an in-memory Map keyed by rounded lat/lng and persists across tests in
+    // this file, so reusing the same point would silently hit that cached result instead of
+    // exercising this test's fetch/gate path.
+    insertPlaceWithCoords(testDb, trip.id, 'Weather buoy', 20, -35, '123 Nowhere Rd, JP');
+
+    await getVisitedRegions(user.id);
+    await vi.runAllTimersAsync();
+    const result = await getVisitedRegions(user.id);
+
+    expect(mockFetch).toHaveBeenCalledTimes(1); // fell through to Nominatim, not a fabricated JP match
+    expect(result.regions['JP']).toBeUndefined();
 
     vi.useRealTimers();
   });
